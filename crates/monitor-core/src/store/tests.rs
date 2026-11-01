@@ -185,6 +185,30 @@ async fn replayed_unspent_does_not_regress_a_spent_row() {
 }
 
 #[tokio::test]
+async fn unspent_after_unknown_spend_backfills_created_version_and_ciphertext() {
+    let (store, address) = store_with_resource().await;
+
+    // First seen as a spend before its unspent output is observed.
+    let mut spend_batch = batch(1, 20);
+    spend_batch.spends.push(spend(1, SpendKind::Spent));
+    store.apply_shard_batch(&address, &spend_batch, &[]).await.unwrap();
+
+    // Later replay of the unspent output must preserve SpendState::Spent while backfilling
+    // created_state_version, ciphertext, and DecryptState::Decrypting.
+    let outcome = store
+        .apply_shard_batch(&address, &batch(1, 10), &[new_unspent(1)])
+        .await
+        .unwrap();
+    assert_eq!(outcome.replayed_unspent, 1);
+
+    let row = store.get_utxo(&address, &utxo_id(1)).await.unwrap();
+    assert_eq!(row.spend_state, SpendState::Spent);
+    assert_eq!(row.created_state_version, Some(10));
+    assert_eq!(row.spent_state_version, Some(20));
+    assert_eq!(row.decrypt_state, DecryptState::Decrypting);
+}
+
+#[tokio::test]
 async fn cursor_is_monotonic() {
     let (store, address) = store_with_resource().await;
 

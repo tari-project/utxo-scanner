@@ -485,7 +485,8 @@ impl Store {
                  ?) ON CONFLICT (resource_address, utxo_id) DO UPDATE SET tag = excluded.tag, fetch_nonce = \
                  excluded.fetch_nonce, ciphertext = COALESCE(utxos.ciphertext, excluded.ciphertext), decrypt_state = \
                  CASE WHEN utxos.ciphertext IS NULL AND excluded.ciphertext IS NOT NULL THEN excluded.decrypt_state \
-                 ELSE utxos.decrypt_state END, updated_at = excluded.updated_at",
+                 ELSE utxos.decrypt_state END, created_state_version = COALESCE(utxos.created_state_version, \
+                 excluded.created_state_version), updated_at = excluded.updated_at",
             )
             .bind(&address)
             .bind(utxo.id.as_bytes().as_slice())

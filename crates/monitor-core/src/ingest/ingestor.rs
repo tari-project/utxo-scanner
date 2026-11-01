@@ -108,6 +108,7 @@ impl<S: UtxoSource> ResourceIngestor<S> {
         {
             warn!(%resource, %err, "failed to requeue out-of-range rows at startup");
         }
+        self.decrypt_pending().await;
 
         loop {
             let pass = tokio::select! {
@@ -216,7 +217,7 @@ impl<S: UtxoSource> ResourceIngestor<S> {
             } else {
                 self.source.fetch_unspent(self.resource_address, &batch.unspent).await?
             };
-            pass.pruned_before_fetch += (batch.unspent.len() - new_unspent.len()) as u64;
+            pass.pruned_before_fetch += batch.unspent.len().saturating_sub(new_unspent.len()) as u64;
 
             let outcome = self
                 .store

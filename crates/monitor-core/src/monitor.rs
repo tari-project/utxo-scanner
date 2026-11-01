@@ -7,7 +7,11 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -77,8 +81,9 @@ struct Inner {
     provider: Provider,
     decrypt_pool: DecryptPool,
     config: MonitorConfig,
-    /// Cancellation handle per running ingestion task, keyed by resource.
-    tasks: Mutex<HashMap<ResourceAddress, CancellationToken>>,
+    /// Task id and cancellation handle per running ingestion task, keyed by resource.
+    tasks: Mutex<HashMap<ResourceAddress, (u64, CancellationToken)>>,
+    next_task_id: AtomicU64,
     /// Cancelled on shutdown; every task token is a child of this.
     root: CancellationToken,
 }
@@ -92,6 +97,7 @@ impl Monitor {
                 decrypt_pool,
                 config,
                 tasks: Mutex::new(HashMap::new()),
+                next_task_id: AtomicU64::new(1),
                 root: CancellationToken::new(),
             }),
         }
@@ -176,7 +182,11 @@ impl Monitor {
                 self.inner.config.default_from_epoch,
             )
             .await?;
-        let row = self.inner.store.get_resource(&address).await?;
+        let mut row = self.inner.store.get_resource(&address).await?;
+        if !row.active {
+            self.inner.store.set_resource_active(&address, true).await?;
+            row.active = true;
+        }
         self.spawn_task(&row).await?;
         Ok(row)
     }
@@ -191,7 +201,7 @@ impl Monitor {
     /// Cancels the resource's ingestion task and marks it inactive. Its ledger is retained.
     pub async fn disable_resource(&self, address: &ResourceAddress) -> Result<(), MonitorError> {
         self.inner.store.set_resource_active(address, false).await?;
-        if let Some(token) = self.inner.tasks.lock().unwrap().remove(address) {
+        if let Some((_, token)) = self.inner.tasks.lock().unwrap().remove(address) {
             token.cancel();
         }
         info!(resource = %address, "resource disabled");
@@ -199,7 +209,15 @@ impl Monitor {
     }
 
     pub async fn reprocess_failed(&self, address: &ResourceAddress) -> Result<u64, MonitorError> {
-        Ok(self.inner.decrypt_pool.requeue_out_of_range(address).await?)
+        let row = self.inner.store.get_resource(address).await?;
+        let requeued = self.inner.decrypt_pool.requeue_out_of_range(address).await?;
+        if requeued > 0 {
+            let view_key = self.inner.store.get_view_key(row.view_key_id).await?;
+            let view_secret = RistrettoSecretKey::from_canonical_bytes(&view_key.secret)
+                .map_err(|_| MonitorError::CorruptViewKey(view_key.id))?;
+            self.inner.decrypt_pool.drain_pending(address, &view_secret).await?;
+        }
+        Ok(requeued)
     }
 
     /// Spawns ingestion tasks for every active resource. Call once on boot.
@@ -248,21 +266,27 @@ impl Monitor {
         .with_decryptor(decryptor);
 
         let token = self.inner.root.child_token();
+        let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         // Insert before spawning so a racing add cannot double-spawn.
         {
             let mut tasks = self.inner.tasks.lock().unwrap();
             if tasks.contains_key(&row.resource_address) {
                 return Ok(());
             }
-            tasks.insert(row.resource_address, token.clone());
+            tasks.insert(row.resource_address, (task_id, token.clone()));
         }
 
         let inner = self.inner.clone();
         let address = row.resource_address;
         tokio::spawn(async move {
             ingestor.run(token).await;
-            // Self-remove when the task ends so a later enable can re-spawn it.
-            inner.tasks.lock().unwrap().remove(&address);
+            // Self-remove when the task ends only if this task is still the active entry,
+            // so a disable followed by a fast re-enable does not have the exiting task
+            // remove the newly spawned task's token.
+            let mut tasks = inner.tasks.lock().unwrap();
+            if tasks.get(&address).is_some_and(|(id, _)| *id == task_id) {
+                tasks.remove(&address);
+            }
         });
         info!(resource = %row.resource_address, "resource ingestion task spawned");
         Ok(())
