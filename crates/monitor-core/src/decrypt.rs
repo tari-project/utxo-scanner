@@ -113,8 +113,9 @@ pub fn decrypt_ciphertexts<L: ValueLookup>(
         // fallible — treat an error as out-of-range rather than crashing the worker.
         match ElgamalVerifiableBalance::decrypt_many(view_secret, &proofs, lookup) {
             Ok(results) => {
-                for (index, value) in proof_indexes.into_iter().zip(results) {
-                    outcomes[index] = Some(match value {
+                let mut results_iter = results.into_iter();
+                for index in proof_indexes {
+                    outcomes[index] = Some(match results_iter.next().flatten() {
                         Some(v) => DecryptOutcome::Value(v),
                         None => DecryptOutcome::OutOfRange,
                     });

@@ -39,6 +39,7 @@ pub fn router(monitor: Monitor) -> Router {
 
 // ---------------------------------- error handling ----------------------------------
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
@@ -217,15 +218,17 @@ async fn create_view_key(
     State(monitor): State<Monitor>,
     Json(body): Json<CreateViewKey>,
 ) -> ApiResult<Json<ViewKeyDto>> {
+    let label = body.label.trim();
+    if label.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "label must not be empty"));
+    }
     let pair = match &body.secret_hex {
         Some(hex_str) => {
             ViewKeyPair::from_secret_hex(hex_str).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?
         },
         None => ViewKeyPair::generate(),
     };
-    let row = monitor
-        .add_view_key(&body.label, &pair.secret_bytes(), &pair.public)
-        .await?;
+    let row = monitor.add_view_key(label, &pair.secret_bytes(), &pair.public).await?;
     Ok(Json(row.into()))
 }
 
@@ -300,12 +303,7 @@ async fn list_utxos(State(monitor): State<Monitor>, Query(params): Query<UtxoLis
         .map(|s| s.parse::<DecryptState>())
         .transpose()
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
-    let utxo_id = params
-        .utxo_id
-        .as_deref()
-        .map(UtxoId::from_hex)
-        .transpose()
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid utxo_id: {e}")))?;
+    let utxo_id = params.utxo_id.as_deref().map(parse_utxo_id).transpose()?;
     let after = params.cursor.as_deref().map(decode_cursor).transpose()?;
 
     // Fetch one extra row to determine whether a further page exists.
@@ -404,12 +402,45 @@ async fn status(State(monitor): State<Monitor>) -> ApiResult<Json<StatusDto>> {
 
 // ---------------------------------- keyset cursor ----------------------------------
 
+fn parse_utxo_id(raw: &str) -> ApiResult<UtxoId> {
+    let trimmed = raw.trim();
+    let hex_part = trimmed.strip_prefix("utxo_").unwrap_or(trimmed);
+    UtxoId::from_hex(hex_part).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid utxo_id: {e}")))
+}
+
 /// Opaque cursor over the row's `rowid` (discovery order).
 fn encode_cursor(row: &UtxoRow) -> String {
     row.rowid.to_string()
 }
 
 fn decode_cursor(raw: &str) -> ApiResult<i64> {
-    raw.parse::<i64>()
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "malformed cursor"))
+    let cursor = raw
+        .parse::<i64>()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "malformed cursor"))?;
+    if cursor <= 0 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "malformed cursor"));
+    }
+    Ok(cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_utxo_id_accepts_both_raw_hex_and_prefixed_display_form() {
+        let id = UtxoId::from_array([0xAB; 32]);
+        let display_str = id.to_string();
+        assert_eq!(parse_utxo_id(&display_str).unwrap(), id);
+        assert_eq!(parse_utxo_id(&hex::encode([0xAB; 32])).unwrap(), id);
+    }
+
+    #[test]
+    fn decode_cursor_rejects_non_positive_and_non_numeric_values() {
+        assert_eq!(decode_cursor("1").unwrap(), 1);
+        assert_eq!(decode_cursor("42").unwrap(), 42);
+        assert!(decode_cursor("0").is_err());
+        assert!(decode_cursor("-5").is_err());
+        assert!(decode_cursor("abc").is_err());
+    }
 }

@@ -31,17 +31,17 @@ use utxo_monitor_core::{
     about = "Monitors the stealth UTXOs of an Ootle resource"
 )]
 struct Cli {
-    /// Indexer to stream UTXO updates from
+    /// Indexer to stream UTXO updates from (required for `run` and `resource add`)
     #[arg(long, env = "MONITOR_INDEXER_URL")]
-    indexer_url: String,
-    /// Ootle network (localnet, esmeralda, mainnet, ...)
+    indexer_url: Option<String>,
+    /// Ootle network (localnet, esmeralda, mainnet, ...; required for `run` and `resource add`)
     #[arg(long, env = "MONITOR_NETWORK")]
-    network: Network,
+    network: Option<Network>,
     #[arg(long, env = "MONITOR_DATABASE", default_value = "./ootle-utxo-monitor.db")]
     database: PathBuf,
-    /// mmap value-lookup file for ElGamal decryption (required — the monitor's whole job is decryption)
+    /// mmap value-lookup file for ElGamal decryption (required for `run` and `resource add`)
     #[arg(long, env = "MONITOR_VALUE_LOOKUP_FILE")]
-    value_lookup_file: PathBuf,
+    value_lookup_file: Option<PathBuf>,
     /// Address the UI + REST API bind to
     #[arg(long, env = "MONITOR_BIND", default_value = "127.0.0.1:9000")]
     bind: SocketAddr,
@@ -116,11 +116,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn connect(cli: &Cli) -> anyhow::Result<IndexerProvider<NoWallet>> {
+    let network = cli.network.context("missing --network (or MONITOR_NETWORK)")?;
+    let indexer_url = cli
+        .indexer_url
+        .as_deref()
+        .context("missing --indexer-url (or MONITOR_INDEXER_URL)")?;
     ProviderBuilder::new()
-        .with_network(cli.network)
-        .connect(&cli.indexer_url)
+        .with_network(network)
+        .connect(indexer_url)
         .await
-        .with_context(|| format!("failed to connect to indexer at {}", cli.indexer_url))
+        .with_context(|| format!("failed to connect to indexer at {indexer_url}"))
 }
 
 fn default_decrypt_workers() -> usize {
@@ -131,8 +136,18 @@ fn default_decrypt_workers() -> usize {
 }
 
 async fn build_monitor(cli: &Cli, store: Store) -> anyhow::Result<Monitor> {
-    let lookup = ValueLookupFile::open(&cli.value_lookup_file)
-        .with_context(|| format!("failed to open value-lookup file {}", cli.value_lookup_file.display()))?;
+    let value_lookup_file = cli
+        .value_lookup_file
+        .as_ref()
+        .context("missing --value-lookup-file (or MONITOR_VALUE_LOOKUP_FILE)")?;
+    let network = cli.network.context("missing --network (or MONITOR_NETWORK)")?;
+    let indexer_url = cli
+        .indexer_url
+        .as_deref()
+        .context("missing --indexer-url (or MONITOR_INDEXER_URL)")?;
+
+    let lookup = ValueLookupFile::open(value_lookup_file)
+        .with_context(|| format!("failed to open value-lookup file {}", value_lookup_file.display()))?;
     info!(
         path = lookup.path(),
         min = *lookup.range().start(),
@@ -150,7 +165,7 @@ async fn build_monitor(cli: &Cli, store: Store) -> anyhow::Result<Monitor> {
         .get_num_preshards()
         .await
         .context("failed to read the network's shard count from the indexer")?;
-    info!(network = %cli.network, %epoch, ?num_preshards, indexer = %cli.indexer_url, "connected to indexer");
+    info!(%network, %epoch, ?num_preshards, indexer = %indexer_url, "connected to indexer");
 
     let workers = cli.decrypt_workers.unwrap_or_else(default_decrypt_workers);
     let decrypt_pool = DecryptPool::new(lookup, workers, store.clone());
@@ -198,6 +213,10 @@ async fn run(cli: Cli, store: Store) -> anyhow::Result<()> {
 async fn view_key_cmd(cmd: &ViewKeyCmd, store: Store) -> anyhow::Result<()> {
     match cmd {
         ViewKeyCmd::Add { label, secret_hex } => {
+            let label = label.trim();
+            if label.is_empty() {
+                anyhow::bail!("--label must not be empty");
+            }
             let pair = match secret_hex {
                 Some(hex_str) => ViewKeyPair::from_secret_hex(hex_str).context("invalid --secret-hex")?,
                 None => ViewKeyPair::generate(),
@@ -263,5 +282,22 @@ async fn resource_cmd(cmd: &ResourceCmd, cli: &Cli, store: Store) -> anyhow::Res
             }
             Ok(())
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_subcommands_parse_without_indexer_or_lookup_flags() {
+        let cli = Cli::try_parse_from(["ootle-utxo-monitor", "view-key", "list"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::ViewKey(ViewKeyCmd::List))));
+
+        let cli = Cli::try_parse_from(["ootle-utxo-monitor", "view-key", "add", "--label", "primary"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::ViewKey(ViewKeyCmd::Add { .. }))));
+
+        let cli = Cli::try_parse_from(["ootle-utxo-monitor", "resource", "list"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Resource(ResourceCmd::List))));
     }
 }
